@@ -1,1 +1,2 @@
-# Python 3.14.7 standard library only.
+# No third-party dependencies: nb2reg uses the Python 3.14.7 standard
+# library only. Nothing needs to be installed after Python itself.
