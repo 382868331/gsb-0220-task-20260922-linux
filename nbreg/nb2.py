@@ -244,23 +244,32 @@ def _check_full_rank(Xv, n, k):
 # Log-likelihood, gradient, observed Hessian (stable formulations)
 # ---------------------------------------------------------------------------
 
-def _loglik_grad_hess(yv, Xv, off, beta, theta):
-    """Return (loglik, grad[k+1], Hessian[k+1][k+1], etas).
+def _nb_terms(yv, Xv, off, beta, theta):
+    """Per-observation NB2 log-likelihood terms and derivatives.
 
-    All quantities are computed with overflow-safe rearrangements:
-      L = log1p(exp(theta+eta)) evaluated via its large-argument form,
-      w = mu/(1+alpha*mu) = exp(eta - L)  in (0, 1/alpha),
-      q = 1/(1+alpha*mu) = exp(-L).
-    Gamma ratios and (tri)gamma differences for integer y are exact finite
-    sums (y <= _SUM_EXACT_MAX_Y), avoiding catastrophic cancellation.
+    Returns ``(terms, etas)`` where ``terms[i]`` is the tuple
+    ``(ll_i, gb_i, gth_i, hw_i, cf_i, hth_i, log_p0_i)`` for observation i:
+
+      * ``ll_i``   -- log NB2 pmf of y_i;
+      * ``gb_i``   -- d ll_i / d eta_i (the score along the linear predictor);
+      * ``gth_i``  -- d ll_i / d log(alpha);
+      * ``hw_i``   -- -d^2 ll_i / d eta_i^2 (>= 0);
+      * ``cf_i``   -- d^2 ll_i / (d eta_i d log alpha);
+      * ``hth_i``  -- d^2 ll_i / d log(alpha)^2;
+      * ``log_p0_i`` -- log P_NB(Y=0) = -r L at this mu.
+
+    All quantities use the same overflow-safe rearrangements as the
+    aggregated objective below; gamma ratios and (tri)gamma differences
+    for integer y are exact finite sums (y <= _SUM_EXACT_MAX_Y).  Kept
+    as a separate per-observation routine so the zero-inflated model can
+    re-weight the count-component scores by the soft posterior
+    responsibility instead of duplicating the math.
     """
     n = len(yv)
     k = len(beta)
     alpha = math.exp(theta)
     r = 1.0 / alpha
-    ll = 0.0
-    g = [0.0] * (k + 1)
-    H = [[0.0] * (k + 1) for _ in range(k + 1)]
+    terms = []
     etas = [0.0] * n
     for i in range(n):
         xi = Xv[i]
@@ -287,27 +296,48 @@ def _loglik_grad_hess(yv, Xv, off, beta, theta):
             lg_ratio = math.lgamma(yi + r) - math.lgamma(r)
             dpsi = _digamma(yi + r) - _digamma(r)
             dtrig = _trigamma(r) - _trigamma(yi + r)
-        ll += lg_ratio - math.lgamma(yi + 1) + yi * (theta + eta) - (yi + r) * L
+        ll_i = (lg_ratio - math.lgamma(yi + 1)
+                + yi * (theta + eta) - (yi + r) * L)
 
         w = math.exp(eta - L)          # mu/(1+alpha*mu) <= 1/alpha
         q = math.exp(-L)
         yr = yi + r
         aw = alpha * w                 # alpha*mu/(1+alpha*mu) < 1
 
-        gb = yi - yr * aw
-        for j in range(k):
-            g[j] += gb * xi[j]
-        g[k] += yi + r * L - r * dpsi - yr * aw
+        gb_i = yi - yr * aw
+        gth_i = yi + r * L - r * dpsi - yr * aw
 
-        hw = yr * aw * q               # -d2l/deta^2 weight (>= 0)
-        cf = aw * (r - yr * q)         # d2l/deta dtheta
+        hw_i = yr * aw * q             # -d2l/deta^2 weight (>= 0)
+        cf_i = aw * (r - yr * q)       # d2l/deta dtheta
+        hth_i = (-r * L + r * dpsi - r * r * dtrig
+                 + 2.0 * r * aw - yr * aw * q)
+        log_p0_i = -r * L              # log NB pmf at k = 0
+        terms.append((ll_i, gb_i, gth_i, hw_i, cf_i, hth_i, log_p0_i))
+    return terms, etas
+
+
+def _loglik_grad_hess(yv, Xv, off, beta, theta):
+    """Return (loglik, grad[k+1], Hessian[k+1][k+1], etas).
+
+    Aggregation of :func:`_nb_terms`; kept identical to the original
+    monolithic formulation (covered by the existing test suite).
+    """
+    k = len(beta)
+    terms, etas = _nb_terms(yv, Xv, off, beta, theta)
+    ll = 0.0
+    g = [0.0] * (k + 1)
+    H = [[0.0] * (k + 1) for _ in range(k + 1)]
+    for i, (ll_i, gb_i, gth_i, hw_i, cf_i, hth_i, _p0) in enumerate(terms):
+        xi = Xv[i]
+        ll += ll_i
         for j in range(k):
             xj = xi[j]
-            H[k][j] += cf * xj
+            g[j] += gb_i * xj
+            H[k][j] += cf_i * xj
             for jj in range(j + 1):
-                H[j][jj] -= hw * xj * xi[jj]
-        H[k][k] += (-r * L + r * dpsi - r * r * dtrig
-                    + 2.0 * r * aw - yr * aw * q)
+                H[j][jj] -= hw_i * xj * xi[jj]
+        g[k] += gth_i
+        H[k][k] += hth_i
     for j in range(k + 1):
         for jj in range(j):
             H[jj][j] = H[j][jj]
