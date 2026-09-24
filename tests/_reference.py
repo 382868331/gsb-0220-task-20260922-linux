@@ -151,3 +151,138 @@ def make_dataset(n, beta_true, alpha_true, offset=None, seed=12345):
         eta = offset[i] + sum(X[i][j] * beta_true[j] for j in range(k))
         y.append(sample_nb(math.exp(eta), alpha_true, next(rng)))
     return y, X, offset
+
+
+# ---------------------------------------------------------------------------
+# Independent ZINB reference (constant logit zero-inflation).
+# Derived directly from the two-component mixture definition; never imports
+# the package under test.
+# ---------------------------------------------------------------------------
+
+def zinb_log_pmf(k, mu, alpha, pi):
+    """log P(Y=k) for the ZINB mixture, from the definition."""
+    if k == 0:
+        p0 = math.exp(nb_log_pmf(0, mu, alpha))
+        return math.log(pi + (1.0 - pi) * p0)
+    return math.log(1.0 - pi) + nb_log_pmf(k, mu, alpha)
+
+
+def zinb_mass(k, mu, alpha, pi):
+    """P(Y=k), direct mixture formula (a second numerical route)."""
+    p0 = (1.0 + alpha * mu) ** (-1.0 / alpha)
+    if k == 0:
+        return pi + (1.0 - pi) * p0
+    return (1.0 - pi) * math.exp(nb_log_pmf(k, mu, alpha))
+
+
+def ref_zinb_loglik(y, X, beta, log_alpha, logit_pi, offset=None):
+    alpha = math.exp(log_alpha)
+    pi = 1.0 / (1.0 + math.exp(-logit_pi))
+    n = len(y)
+    if offset is None:
+        offset = [0.0] * n
+    total = 0.0
+    for i in range(n):
+        eta = offset[i] + sum(X[i][j] * beta[j] for j in range(len(beta)))
+        total += zinb_log_pmf(y[i], math.exp(eta), alpha, pi)
+    return total
+
+
+def ref_zinb_fd_gradient(y, X, beta, log_alpha, logit_pi, offset=None,
+                         h=1e-6):
+    """Central finite differences of the reference ZINB log-likelihood."""
+    g = []
+    b = list(beta)
+    for j in range(len(b)):
+        b[j] += h
+        up = ref_zinb_loglik(y, X, b, log_alpha, logit_pi, offset)
+        b[j] -= 2 * h
+        dn = ref_zinb_loglik(y, X, b, log_alpha, logit_pi, offset)
+        b[j] = beta[j]
+        g.append((up - dn) / (2 * h))
+    up = ref_zinb_loglik(y, X, beta, log_alpha + h, logit_pi, offset)
+    dn = ref_zinb_loglik(y, X, beta, log_alpha - h, logit_pi, offset)
+    g.append((up - dn) / (2 * h))
+    up = ref_zinb_loglik(y, X, beta, log_alpha, logit_pi + h, offset)
+    dn = ref_zinb_loglik(y, X, beta, log_alpha, logit_pi - h, offset)
+    g.append((up - dn) / (2 * h))
+    return g
+
+
+def ref_fit_zinb(y, X, starts, offset=None, max_iter=20000, tol=1e-10):
+    """Independent ZINB MLE: numerical-gradient coordinate ascent over
+    (beta, log_alpha, logit_pi), multi-start.  Slow but shares no code
+    with the analytic fitter under test.  Returns (params, loglik).
+    """
+    n = len(y)
+    if offset is None:
+        offset = [0.0] * n
+
+    def ll(p):
+        k = len(X[0])
+        return ref_zinb_loglik(y, X, p[:k], p[k], p[k + 1], offset)
+
+    best = None
+    for start in starts:
+        p = list(start)
+        # keep the optimizer inside the same finite box the fitter uses
+        lo = [-20.0] * (len(p) - 2) + [-20.0, -30.0]
+        hi = [20.0] * (len(p) - 2) + [25.0, 30.0]
+        cur = ll(p)
+        base_step = 2e-3
+        for _ in range(max_iter):
+            moved = False
+            for j in range(len(p)):
+                h = 1e-5
+                bp = list(p); bp[j] += h
+                bm = list(p); bm[j] -= h
+                deriv = (ll(bp) - ll(bm)) / (2 * h)
+                if abs(deriv) < tol:
+                    continue
+                step = base_step
+                for _halves in range(40):
+                    cand = list(p)
+                    cand[j] += step * (1.0 if deriv > 0 else -1.0)
+                    if cand[j] <= lo[j] or cand[j] >= hi[j]:
+                        step *= 0.5
+                        continue
+                    val = ll(cand)
+                    if val > cur + 1e-12:
+                        p, cur, moved = cand, val, True
+                        break
+                    step *= 0.5
+            if not moved:
+                break
+        if best is None or cur > best[1]:
+            best = (p, cur)
+    return best
+
+
+def sample_zinb(mu, alpha, pi, u_struct, u_count):
+    """One ZINB draw: u_struct < pi -> structural 0, else an NB draw."""
+    if u_struct < pi:
+        return 0
+    return sample_nb(mu, alpha, u_count)
+
+
+def make_zinb_dataset(n, beta_true, alpha_true, pi_true, seed=12345):
+    """Deterministic ZINB sample with an explicit two-stage draw: the
+    structural/count coin is drawn separately, so the generative process
+    really is a mixture (the analyzer is never told which zeros were
+    structural)."""
+    rng = _lcg(seed)
+    k = len(beta_true)
+    X = [[float((i * (j + 3)) % 7 - 3) / 2.0 for j in range(k)]
+         for i in range(n)]
+    y = []
+    labels = []
+    for i in range(n):
+        eta = sum(X[i][j] * beta_true[j] for j in range(k))
+        u_struct = next(rng)
+        if u_struct < pi_true:
+            y.append(0)
+            labels.append(1)
+        else:
+            y.append(sample_nb(math.exp(eta), alpha_true, next(rng)))
+            labels.append(0)
+    return y, X, labels
