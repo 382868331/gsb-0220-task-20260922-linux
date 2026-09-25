@@ -19,8 +19,8 @@ Var(y_i) = mu_i + alpha · mu_i²        (alpha > 0)
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（28 个）
-python demo.py                            # 固定输入演示，实测约 0.05 秒（远低于 8 秒预算）
+python -m unittest discover -s tests -v   # 必要测试（45 个）
+python demo.py                            # 固定输入演示，实测约 0.05 秒（远低于 90 秒预算）
 ```
 
 无需网络、账号、密钥、Docker、数据库或任何中间件；不读取任何配置或环境变量。
@@ -62,6 +62,39 @@ python demo.py                            # 固定输入演示，实测约 0.05 
   `mu>0` 每个似然因子 `<1`，上确界 0 只在 `mu→0 (eta→-∞)` 达到，有限参数无 MLE；
   联合与固定 alpha 模式同此结论。
 
+
+### `fit_nb2_bounded(y, X, offset=None, nonneg=None, fixed_alpha=None, alpha_init=None, max_iter=200, gtol=1e-8) -> NB2BoundedResult`
+
+与 `fit_nb2` 同模型、同似然、同 offset 与 alpha 模式，新增**系数非负边界**：
+
+- `nonneg`：`None` 或若干 int 列号（0 起，拒绝 bool、重复与越界）。这些
+  `beta_j` 被约束为 `>= 0`；其余 beta 与 `log alpha` 仍自由。**约束只作用于
+  系数**，不通过裁剪 y 或 mu 实现；offset 与 NB2 似然保持不变。
+- 算法：**投影牛顿 + 主动集**。位于 0 且梯度指向可行域外（最大化时
+  `dll/dbeta_j <= 0`）的边界系数在牛顿求解中冻结；梯度为正（指向内部）则释放。
+  牛顿系统只在自由子空间求解；试步投影回盒子后，Armijo 回溯**同时要求可行与
+  目标改善**（按实际投影步做充分下降判定）；溢出步（`|eta|>700`、`log alpha`
+  出盒）照旧回溯拒绝。`log alpha` 盒界同样投影 + KKT 冻结。
+- 收敛报告**同时检查自由梯度与边界 KKT 条件**：自由子空间梯度无穷范数与
+  活跃边界处的正梯度违例都 `<= gtol * max(1, |loglik|)` 才判 `converged`，
+  不因参数变化小就宣布成功。
+- 显式 `fixed_alpha` 模式继续可用（梯度长度为 k）；联合模式保留
+  `near_poisson` 诊断。
+- 全零计数：若边界不阻挡 `eta -> -inf`（存在同号自由列或全负有界列），
+  仍判 `no_finite_mle`；否则可行盒使 eta 有界，最优点在边界上由迭代求出。
+
+`NB2BoundedResult` 在 `NB2Result` 同名字段外增加：
+
+| 字段 | 含义 |
+|---|---|
+| `nonneg` | 受约束列号（排序元组） |
+| `active_bounds` | 返回点处位于 0 的受约束列 |
+| `free_grad_norm` | 自由坐标梯度无穷范数 |
+| `max_kkt_violation` | 活跃边界处 max(0, dll/dbeta_j) 的最大值 |
+
+状态语义（`converged` / `max_iter` / `line_search_failed` / `no_finite_mle`）
+与 `fit_nb2` 完全一致。
+
 ### 纯函数（便于独立核验）
 
 - `nb2_loglik(y, X, beta, log_alpha, offset=None) -> float`
@@ -95,10 +128,14 @@ python demo.py                            # 固定输入演示，实测约 0.05 
 4. **近 Poisson 边界的主动集处理**。`log alpha` 顶到边界且梯度向外时冻结该坐标
    （KKT 投影），防止 `alpha→0` 时近奇异的 Hessian 把微小的 theta 移动耦合进
    beta 块导致停滞；同时置 `near_poisson`。
-5. **特殊函数自行实现**。`digamma`：递推至 x≥10 后用 Bernoulli 数渐近展开；
+5. **系数非负边界（`fit_nb2_bounded`）**：投影牛顿 + 主动集。边界系数是否释放
+   依据梯度方向（`dll/dbeta_j > 0` 才释放）；牛顿步在自由子空间求解，试步投影
+   回盒子，Armijo 回溯同时要求可行与目标改善；收敛需自由梯度与边界 KKT 违例
+   同时低于容差。
+6. **特殊函数自行实现**。`digamma`：递推至 x≥10 后用 Bernoulli 数渐近展开；
    `trigamma`：递推至 x≥12 后渐近展开。整数计数处的 `psi(y+r)-psi(r)` 等差值
    在 `y ≤ 4096` 时用精确有限和，避免大数相减。
-6. **初值**：常数列吸收 `log(mean(y)+0.5) − mean(offset)`；alpha 用矩法
+7. **初值**：常数列吸收 `log(mean(y)+0.5) − mean(offset)`；alpha 用矩法
    （`(Var−mean)/mean²`）并夹到支持区间内。
 
 ## 误差口径（float64 / IEEE-754 双精度）
@@ -122,6 +159,11 @@ python demo.py                            # 固定输入演示，实测约 0.05 
 - `tests/test_nb2.py`：28 个测试，覆盖全零计数、offset、重复列（秩亏拒绝）、
   高离散数据、近 Poisson 边界、输入校验与不修改输入、梯度有限差分、
   PMF 归一化与截断概率和、固定 alpha 独立优化器对比、预算耗尽 vs 无解分离。
+- `tests/test_nb2_bounded.py`：17 个测试，覆盖边界拟合：小维度**枚举活跃边界**
+  并在自由子空间用独立参考似然坐标上升求解作参照、独立有限差分梯度核对、
+  最优恰为零（对称设计）、约束使原负系数不可用、共线列拒绝、全零计数
+  （可逃逸判 `no_finite_mle` / 被边界挡住时收敛到边界最优点）、回溯溢出拒绝、
+  固定 alpha 模式、联合模式近 Poisson 诊断，以及旧无边界 `fit_nb2` 结果保留。
 - `tests/_reference.py`：**独立参考，不 import 被测核心**。用 lgamma 定义式、
   pmf 比值递推、中心有限差分、坐标式数值梯度上升各自独立给出期望值；
   确定性数据由私有 LCG + CDF 反演生成。核心↔核心的“往返一致”只作补充
@@ -146,9 +188,10 @@ python demo.py                            # 固定输入演示，实测约 0.05 
 
 ```
 nbreg/__init__.py     公共接口
-nbreg/nb2.py          核心：特殊函数、似然/梯度/Hessian、牛顿拟合
-tests/test_nb2.py     必要测试
+nbreg/nb2.py          核心：特殊函数、似然/梯度/Hessian、牛顿拟合（无界+有界）
+tests/test_nb2.py     必要测试（无界拟合）
+tests/test_nb2_bounded.py  必要测试（系数非负边界拟合）
 tests/_reference.py   独立参考（不调用被测核心）
-demo.py               固定输入演示：正常拟合 + 真实触发的异常边界 + 结构边界
+demo.py               固定输入演示：正常拟合 + 真实触发的异常边界 + 结构边界 + 有界拟合
 README.md
 ```

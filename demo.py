@@ -17,7 +17,7 @@ Run:  python demo.py     (expected runtime well under 8 seconds)
 import math
 import time
 
-from nbreg import fit_nb2, nb2_objective, NBFitError
+from nbreg import fit_nb2, fit_nb2_bounded, nb2_objective, NBFitError
 
 
 def lcg(seed):
@@ -132,6 +132,35 @@ def main():
     print(f"    loglik       : {rz.loglik:.6f} (supremum 0 unreached at "
           f"finite mu)")
     print(f"    verdict      : {rz.message}")
+
+    # ------------------------------------------------------------------
+    # 4. Bounded fit: beta_1 >= 0 blocks the negative unconstrained MLE
+    # ------------------------------------------------------------------
+    print("\n[4] BOUNDED FIT (beta_1 >= 0, everything else free)")
+    print(f"    unconstrained beta : {[round(b, 6) for b in res.beta]}")
+    rbd = fit_nb2_bounded(y, X, offset=offset, nonneg=[1])
+    print(f"    status       : {rbd.status} (converged={rbd.converged})")
+    print(f"    message      : {rbd.message}")
+    print(f"    beta         : {[round(b, 6) for b in rbd.beta]}  "
+          f"(active bounds: {rbd.active_bounds})")
+    print(f"    log(alpha)   : {rbd.log_alpha:.6f}  alpha={rbd.alpha:.6f}")
+    print(f"    loglik       : {rbd.loglik:.8f} (<= unconstrained "
+          f"{res.loglik:.8f}: {rbd.loglik <= res.loglik + 1e-9})")
+    print(f"    free |grad|  : {rbd.free_grad_norm:.2e},  KKT violation: "
+          f"{rbd.max_kkt_violation:.2e}")
+    print(f"    grad at bound: {rbd.gradient[1]:+.4e} (<= 0, bound stays)")
+    print(f"    iterations   : {rbd.n_iter}, backtracking rejections: "
+          f"{rbd.n_rejected}")
+    rbf = fit_nb2_bounded(y, X, offset=offset, nonneg=[1], fixed_alpha=3.0)
+    print(f"[4b] fixed alpha=3.0 bounded: status={rbf.status}, "
+          f"beta={[round(b, 6) for b in rbf.beta]}, "
+          f"loglik={rbf.loglik:.6f}")
+    # all-zero counts with the intercept itself bounded and X > 0:
+    # eta -> -inf is infeasible, so the optimum is the finite boundary
+    rzb = fit_nb2_bounded([0] * 6, [[1.0]] * 6, nonneg=[0])
+    print(f"[4c] all-zero, bounded intercept: status={rzb.status}, "
+          f"beta={rzb.beta}, active={rzb.active_bounds}, "
+          f"KKT violation={rzb.max_kkt_violation:.1e}")
 
     print(f"\n(elapsed {time.perf_counter() - t0:.2f} s; all computations "
           f"real, none pre-recorded)")

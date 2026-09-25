@@ -50,6 +50,54 @@ class NBFitError(ValueError):
     """
 
 
+_BOUND_TOL = 1e-10        # a bounded coefficient at <= this is "at the bound"
+
+
+@dataclass(frozen=True)
+class NB2BoundedResult:
+    """Outcome of :func:`fit_nb2_bounded`.
+
+    Same status vocabulary as :class:`NB2Result`.  ``converged`` is True
+    only when BOTH the free-subspace gradient and the boundary KKT
+    conditions are below tolerance -- never because a parameter step
+    happened to be small.
+
+    Extra fields:
+
+    * ``nonneg``            -- sorted tuple of the constrained column
+                               indices (beta_j >= 0).
+    * ``active_bounds``     -- constrained indices sitting at 0 in the
+                               returned point.
+    * ``free_grad_norm``    -- infinity norm of the gradient over the
+                               free coordinates (unconstrained betas and
+                               bounded betas not at their bound, plus
+                               log alpha in joint mode).
+    * ``max_kkt_violation`` -- max over bounded coefficients at 0 of
+                               max(0, d ll / d beta_j); a positive value
+                               means the bound wants to release.  Zero
+                               when no bound is active.
+    """
+
+    converged: bool
+    status: str
+    message: str
+    beta: list
+    log_alpha: float
+    alpha: float
+    loglik: float
+    gradient: list
+    n_iter: int
+    n_rejected: int
+    near_poisson: bool
+    fixed_alpha: bool
+    n_obs: int
+    n_params: int
+    nonneg: tuple
+    active_bounds: tuple
+    free_grad_norm: float
+    max_kkt_violation: float
+
+
 @dataclass(frozen=True)
 class NB2Result:
     """Outcome of :func:`fit_nb2`.
@@ -674,3 +722,298 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
         n_obs=n,
         n_params=dim,
     )
+
+# ---------------------------------------------------------------------------
+# Bounded-coefficient fitter (projected Newton with an active set)
+# ---------------------------------------------------------------------------
+
+def _validate_nonneg(nonneg, k):
+    """Return a sorted tuple of unique column indices, or raise."""
+    if nonneg is None:
+        return ()
+    if isinstance(nonneg, (str, bytes)):
+        raise NBFitError("nonneg must be a sequence of column indices, not a string")
+    try:
+        idxs = list(nonneg)
+    except TypeError:
+        raise NBFitError("nonneg must be a sequence of column indices") from None
+    seen = set()
+    for j in idxs:
+        if type(j) is not int:
+            raise NBFitError(
+                "nonneg entries must be int column indices (bool rejected), "
+                f"got {type(j).__name__} {j!r}")
+        if not 0 <= j < k:
+            raise NBFitError(
+                f"nonneg index {j} out of range: X has columns 0..{k - 1}")
+        if j in seen:
+            raise NBFitError(f"nonneg index {j} listed twice")
+        seen.add(j)
+    return tuple(sorted(seen))
+
+
+def fit_nb2_bounded(y, X, offset=None, nonneg=None, fixed_alpha=None,
+                    alpha_init=None, max_iter=200, gtol=1e-8):
+    """Fit the NB2 regression with non-negativity bounds on some betas.
+
+    Same model, likelihood, offset handling and alpha modes as
+    :func:`fit_nb2`; the only difference is that the coefficients listed
+    in `nonneg` are constrained to `beta_j >= 0`.  The constraint acts
+    on the coefficients only -- y and mu are never clipped or altered.
+
+    Parameters are identical to :func:`fit_nb2` plus:
+
+    nonneg : None or sequence of int column indices (0-based, bool
+        rejected, duplicates rejected).  These coefficients are kept
+        non-negative; all other betas and log alpha remain free.
+
+    Method: projected Newton with an active set.  A bounded coefficient
+    sitting at 0 whose gradient points out of the feasible region
+    (d ll/d beta_j <= 0, since we maximize) is frozen for the Newton
+    solve; one whose gradient points inward (positive) is released.
+    The Newton system is solved in the free subspace only; the trial
+    step is projected back onto the box, and the Armijo backtracking
+    accepts a step only if it is feasible AND improves the objective
+    (sufficient decrease on the actual projected step).  Steps that
+    would overflow (|eta| > 700, log alpha outside its box) are rejected
+    by the backtracking, exactly as in the unconstrained fitter.
+
+    Convergence requires BOTH the free-subspace gradient infinity-norm
+    AND the boundary KKT violation (positive gradient at an active
+    bound) to fall below `gtol * max(1, |loglik|)`; a small parameter
+    move alone never declares success.
+
+    Returns an NB2BoundedResult in all fitting outcomes; raises
+    NBFitError only for invalid input or a rank-deficient design.
+    """
+    yv, Xv, off = _validate_xy(y, X, offset)
+    n = len(yv)
+    k = len(Xv[0])
+
+    if type(max_iter) is not int or not 1 <= max_iter <= 1_000_000:
+        raise NBFitError(
+            f"max_iter must be an int in [1, 1000000] (bool rejected), "
+            f"got {max_iter!r}")
+    if not _is_real(gtol) or not math.isfinite(gtol) or not 0.0 < gtol <= 1.0:
+        raise NBFitError(f"gtol must be a finite real in (0, 1], got {gtol!r}")
+    if fixed_alpha is not None:
+        fixed_alpha = _validate_positive_alpha(fixed_alpha, "fixed_alpha")
+    if alpha_init is not None:
+        alpha_init = _validate_positive_alpha(alpha_init, "alpha_init")
+    bounded = _validate_nonneg(nonneg, k)
+    bset = set(bounded)
+
+    _check_full_rank(Xv, n, k)
+    joint = fixed_alpha is None
+    dim = k + 1 if joint else k
+    theta_fixed = math.log(fixed_alpha) if fixed_alpha is not None else None
+
+    # ---- starting values (same heuristic as fit_nb2, then projected) ---
+    mean_y = sum(yv) / n
+    mean_off = sum(off) / n
+    beta0 = [0.0] * k
+    for j in range(k):
+        c0 = Xv[0][j]
+        if c0 != 0.0 and all(Xv[i][j] == c0 for i in range(n)):
+            beta0[j] = (math.log(mean_y + 0.5) - mean_off) / c0
+            break
+    for j in bset:
+        beta0[j] = max(0.0, beta0[j])
+    if joint:
+        if alpha_init is not None:
+            theta0 = math.log(alpha_init)
+        else:
+            var_y = sum((v - mean_y) ** 2 for v in yv) / n
+            a0 = (var_y - mean_y) / max(mean_y, 0.5) ** 2
+            a0 = min(max(a0, math.exp(LOG_ALPHA_MIN + 2.0)), math.exp(6.0))
+            theta0 = math.log(a0)
+        p = beta0 + [theta0]
+    else:
+        p = list(beta0)
+
+    def evaluate(pv):
+        theta = pv[k] if joint else theta_fixed
+        if not LOG_ALPHA_MIN <= theta <= LOG_ALPHA_MAX:
+            return None  # out-of-bounds step: rejected by backtracking
+        ll, g, H, etas = _loglik_grad_hess(yv, Xv, off, pv[:k], theta)
+        if not math.isfinite(ll):
+            return None
+        for e in etas:
+            if e > _ETA_LIMIT or e < -_ETA_LIMIT:
+                return None  # overflow territory: rejected by backtracking
+        if not joint:
+            g = g[:k]
+            H = [row[:k] for row in H[:k]]
+        return ll, g, H, etas
+
+    ev = evaluate(p)
+    if ev is None:
+        raise NBFitError(
+            "initial point is outside the computable region: need "
+            f"|x_i.beta + offset_i| <= {_ETA_LIMIT:.0f} for every row and "
+            f"log_alpha in [{LOG_ALPHA_MIN}, {LOG_ALPHA_MAX}]; rescale X or "
+            f"offset (values are never clipped silently)")
+
+    def kkt_report(pv, gv):
+        """(free_grad_norm, max_kkt_violation, active_bounds) at a point.
+
+        log alpha at a box bound with the gradient pointing outward is
+        KKT-satisfied (projected away), exactly as in fit_nb2.
+        """
+        free_norm = 0.0
+        viol = 0.0
+        active = []
+        for j in range(dim):
+            if j in bset and pv[j] <= _BOUND_TOL:
+                active.append(j)
+                if gv[j] > viol:
+                    viol = gv[j]
+            elif (joint and j == k and (
+                    (pv[k] <= LOG_ALPHA_MIN + 1e-9 and gv[k] < 0.0) or
+                    (pv[k] >= LOG_ALPHA_MAX - 1e-9 and gv[k] > 0.0))):
+                pass  # KKT at the log-alpha box bound
+            else:
+                if abs(gv[j]) > free_norm:
+                    free_norm = abs(gv[j])
+        return free_norm, viol, active
+
+    def make_result(status, message, it, n_rejected, pv, evv):
+        ll, g, _, _ = evv
+        free_norm, viol, active = kkt_report(pv, g)
+        if joint:
+            log_alpha = pv[k]
+            alpha = math.exp(log_alpha)
+        else:
+            log_alpha = theta_fixed
+            alpha = fixed_alpha
+        return NB2BoundedResult(
+            converged=(status == "converged"),
+            status=status,
+            message=message,
+            beta=list(pv[:k]),
+            log_alpha=log_alpha,
+            alpha=alpha,
+            loglik=ll,
+            gradient=list(g),
+            n_iter=it,
+            n_rejected=n_rejected,
+            near_poisson=(alpha < _NEAR_POISSON_ALPHA),
+            fixed_alpha=not joint,
+            n_obs=n,
+            n_params=dim,
+            nonneg=tuple(bounded),
+            active_bounds=tuple(active),
+            free_grad_norm=free_norm,
+            max_kkt_violation=viol,
+        )
+
+    if all(v == 0 for v in yv):
+        # Same proved structural verdict as fit_nb2, but only when the
+        # supremum direction eta -> -inf is feasible under the bounds.
+        # Sufficient check: some column can drive every eta to -inf --
+        # a free column of one sign, or a bounded column of all-negative
+        # entries (beta_j -> +inf).  Otherwise the feasible box keeps
+        # eta finite and the boundary optimum is found by the iteration.
+        escapable = False
+        for j in range(k):
+            col = [Xv[i][j] for i in range(n)]
+            if j in bset:
+                if all(c < 0.0 for c in col):
+                    escapable = True
+            else:
+                if all(c > 0.0 for c in col) or all(c < 0.0 for c in col):
+                    escapable = True
+        if escapable:
+            return make_result(
+                "no_finite_mle",
+                "all counts are zero and the bounds do not block eta -> "
+                "-inf: the log-likelihood is < 0 for every finite mu and "
+                "reaches its supremum 0 only as mu -> 0; no finite MLE "
+                "exists, in joint or fixed-alpha mode",
+                0, 0, p, ev)
+
+    n_rejected = 0
+    it = 0
+    status = None
+    message = ""
+
+    while True:
+        ll, g, H, etas = ev
+        scale = max(1.0, abs(ll))
+        free_norm, viol, active_list = kkt_report(p, g)
+        if free_norm <= gtol * scale and viol <= gtol * scale:
+            status = "converged"
+            message = ("free-subspace gradient and boundary KKT violation "
+                       "both below gtol * max(1, |loglik|)")
+            break
+        if it >= max_iter:
+            status = "max_iter"
+            message = (f"iteration budget exhausted (max_iter={max_iter}); "
+                       "returned point is the best found, not a certified "
+                       "optimum")
+            break
+
+        # --- active set: freeze bounded coords at 0 whose gradient does
+        # not point into the feasible interior; release the rest. -------
+        active = set(j for j in active_list if g[j] <= 0.0)
+        if joint:  # freeze log alpha at a box bound with outward gradient
+            if p[k] <= LOG_ALPHA_MIN + 1e-9 and g[k] < 0.0:
+                active.add(k)
+            elif p[k] >= LOG_ALPHA_MAX - 1e-9 and g[k] > 0.0:
+                active.add(k)
+        free = [j for j in range(dim) if j not in active]
+        nf = len(free)
+
+        # --- damped Newton in the free subspace -------------------------
+        negH = [[-H[free[a]][free[b]] for b in range(nf)] for a in range(nf)]
+        gf = [g[j] for j in free]
+        diag = max(1.0, max(negH[a][a] for a in range(nf)))
+        lam = 1e-10 * diag
+        d = None
+        for _ in range(14):
+            M = [[negH[a][b] + (lam if a == b else 0.0)
+                  for b in range(nf)] for a in range(nf)]
+            d = _cholesky_solve(M, gf)
+            if d is not None and sum(gf[a] * d[a] for a in range(nf)) > 0.0:
+                break
+            lam *= 100.0
+            d = None
+        if d is None:  # fall back to steepest ascent in the free subspace
+            d = list(gf)
+        dn = max(abs(v) for v in d)
+        if dn > _STEP_CAP:
+            d = [v * (_STEP_CAP / dn) for v in d]
+
+        # --- projected Armijo backtracking: feasible AND improving -----
+        s = 1.0
+        accepted = None
+        for _ in range(60):
+            cand = list(p)
+            for a in range(nf):
+                cand[free[a]] = p[free[a]] + s * d[a]
+            for j in bset:
+                if cand[j] < 0.0:
+                    cand[j] = 0.0
+            if joint:  # project the log-alpha box as well
+                if cand[k] < LOG_ALPHA_MIN:
+                    cand[k] = LOG_ALPHA_MIN
+                elif cand[k] > LOG_ALPHA_MAX:
+                    cand[k] = LOG_ALPHA_MAX
+            step = [cand[i] - p[i] for i in range(dim)]
+            gtd = sum(g[i] * step[i] for i in range(dim))
+            evc = evaluate(cand)
+            if evc is not None and gtd > 0.0 and evc[0] >= ll + 1e-4 * gtd:
+                accepted = (cand, evc)
+                break
+            s *= 0.5
+            n_rejected += 1
+        if accepted is None:
+            status = "line_search_failed"
+            message = ("projected backtracking line search found no "
+                       "feasible improving step in 60 halvings; returned "
+                       "point is not a certified optimum")
+            break
+        p, ev = accepted
+        it += 1
+
+    return make_result(status, message, it, n_rejected, p, ev)

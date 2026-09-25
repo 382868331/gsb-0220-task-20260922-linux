@@ -1,9 +1,11 @@
 """NB2 negative-binomial regression for count measurements (stdlib only)."""
 
 from .nb2 import (
+    NB2BoundedResult,
     NB2Result,
     NBFitError,
     fit_nb2,
+    fit_nb2_bounded,
     nb2_loglik,
     nb2_objective,
     nb2_pmf,
@@ -14,9 +16,11 @@ from .nb2 import (
 )
 
 __all__ = [
+    "NB2BoundedResult",
     "NB2Result",
     "NBFitError",
     "fit_nb2",
+    "fit_nb2_bounded",
     "nb2_loglik",
     "nb2_objective",
     "nb2_pmf",
