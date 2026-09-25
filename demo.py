@@ -10,6 +10,9 @@ Runs entirely offline, deterministically, standard library only.  It prints:
   3. a genuinely triggered *structural* boundary: all-zero counts return
      status "no_finite_mle" -- a proved boundary, distinct from a budget
      exhaustion ("max_iter"), which is also shown.
+  4. a bounded fit (slope constrained >= 0, true value negative): the
+     coefficient is pinned at exactly 0.0, with KKT diagnostics, plus an
+     inactive-bound case that reproduces the unconstrained fit.
 
 Run:  python demo.py     (expected runtime well under 8 seconds)
 """
@@ -17,7 +20,7 @@ Run:  python demo.py     (expected runtime well under 8 seconds)
 import math
 import time
 
-from nbreg import fit_nb2, nb2_objective, NBFitError
+from nbreg import fit_nb2, fit_nb2_bounded, nb2_objective, NBFitError
 
 
 def lcg(seed):
@@ -132,6 +135,32 @@ def main():
     print(f"    loglik       : {rz.loglik:.6f} (supremum 0 unreached at "
           f"finite mu)")
     print(f"    verdict      : {rz.message}")
+
+    # ------------------------------------------------------------------
+    # 4. Coefficient bounds: slope constrained to be >= 0
+    # ------------------------------------------------------------------
+    print("\n[4] COEFFICIENT BOUNDS (nonneg on the slope, true value -0.3)")
+    rb4 = fit_nb2_bounded(y, X, offset=offset, nonneg=[False, True])
+    print(f"    status       : {rb4.status} (converged={rb4.converged})")
+    print(f"    message      : {rb4.message}")
+    print(f"    beta         : {[round(b, 6) for b in rb4.beta]}  "
+          f"(slope pinned at exactly {rb4.beta[1]})")
+    print(f"    active_bounds: {rb4.active_bounds}")
+    print(f"    loglik       : {rb4.loglik:.8f} (<= unconstrained "
+          f"{res.loglik:.8f}: {rb4.loglik <= res.loglik + 1e-9})")
+    # KKT diagnostics at the pinned coefficient, via the SAME objective:
+    # free-coordinate gradient ~ 0, pinned-coordinate gradient <= 0.
+    _, g4 = nb2_objective(y, X, rb4.beta, rb4.log_alpha, offset)
+    print(f"    KKT check    : free |g_intercept|={abs(g4[0]):.2e}, "
+          f"g_slope={g4[1]:+.4e} (must be <= 0 at the pinned zero)")
+    # With the constraint on the truly positive coefficient nothing
+    # changes: the bound is inactive and the unconstrained fit returns.
+    rb5 = fit_nb2_bounded(y, X, offset=offset, nonneg=[True, False])
+    print(f"    inactive bound on intercept: beta="
+          f"{[round(b, 6) for b in rb5.beta]}, "
+          f"active_bounds={rb5.active_bounds}, "
+          f"matches unconstrained: "
+          f"{all(abs(a - b) < 1e-6 for a, b in zip(rb5.beta, res.beta))}")
 
     print(f"\n(elapsed {time.perf_counter() - t0:.2f} s; all computations "
           f"real, none pre-recorded)")

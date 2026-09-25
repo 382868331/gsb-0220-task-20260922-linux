@@ -13,6 +13,7 @@ expected values:
 """
 
 import math
+from itertools import combinations
 
 
 def nb_log_pmf(k, mu, alpha):
@@ -73,16 +74,22 @@ def ref_fd_gradient(y, X, beta, log_alpha, offset=None, h=1e-6):
     return g
 
 
-def ref_fit_beta_fixed_alpha(y, X, alpha, offset=None,
+def ref_fit_beta_fixed_alpha(y, X, alpha, offset=None, free_mask=None,
                              max_iter=20000, tol=1e-10):
     """Independent beta-only MLE at fixed alpha.
 
     Numerical-gradient ascent (central differences on the reference
     likelihood) with per-coordinate step halving.  Slow but completely
     independent of the analytic machinery under test.
+
+    ``free_mask`` (optional) restricts movement to the coordinates
+    flagged True; the others stay at 0.  Used by the bounded-fit
+    enumeration reference below.
     """
     n = len(y)
     k = len(X[0])
+    if free_mask is None:
+        free_mask = [True] * k
     if offset is None:
         offset = [0.0] * n
     beta = [0.0] * k
@@ -91,6 +98,8 @@ def ref_fit_beta_fixed_alpha(y, X, alpha, offset=None,
     for _ in range(max_iter):
         moved = False
         for j in range(k):
+            if not free_mask[j]:
+                continue
             h = 1e-5
             bp = list(beta)
             bp[j] += h
@@ -113,6 +122,46 @@ def ref_fit_beta_fixed_alpha(y, X, alpha, offset=None,
         if not moved:
             break
     return beta, cur
+
+
+def ref_beta_gradient(y, X, beta, alpha, offset=None, h=1e-6):
+    """Central finite differences of the reference loglik, beta only."""
+    return ref_fd_gradient(y, X, beta, math.log(alpha), offset, h=h)[:len(beta)]
+
+
+def ref_fit_bounded_enum(y, X, nonneg, alpha, offset=None):
+    """Independent bounded-fit reference by exhaustive active-set enum.
+
+    Fixed alpha.  Every subset S of the non-negativity-constrained
+    coefficients is pinned at 0 in turn; the remaining coefficients are
+    optimized in the free subspace by the independent numerical-gradient
+    optimizer above.  A candidate is accepted only if it is feasible
+    (bounded free coordinates >= 0) and satisfies the boundary KKT
+    condition (gradient <= tolerance at every pinned coordinate, for a
+    maximization with beta_j >= 0).  The best feasible KKT point wins.
+
+    Returns (beta, loglik, pinned_set) of the winner.
+    """
+    k = len(X[0])
+    bounded = [j for j in range(k) if nonneg[j]]
+    best = None
+    for r in range(len(bounded) + 1):
+        for pinned in combinations(bounded, r):
+            free_mask = [j not in pinned for j in range(k)]
+            beta, ll = ref_fit_beta_fixed_alpha(
+                y, X, alpha, offset, free_mask=free_mask)
+            if any(nonneg[j] and beta[j] < -1e-9 for j in range(k)):
+                continue  # optimizer left the feasible box: discard
+            beta = [max(0.0, b) if nonneg[j] else b
+                    for j, b in enumerate(beta)]
+            g = ref_beta_gradient(y, X, beta, alpha, offset)
+            if any(g[j] > 1e-4 for j in pinned):
+                continue  # boundary KKT violated: not a candidate
+            if best is None or ll > best[1]:
+                best = (beta, ll, pinned)
+    if best is None:
+        raise AssertionError("enumeration found no feasible KKT point")
+    return best
 
 
 # Deterministic generator ---------------------------------------------------

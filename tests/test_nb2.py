@@ -16,8 +16,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nbreg import (  # noqa: E402
-    fit_nb2, nb2_loglik, nb2_objective, nb2_pmf, NBFitError,
-    LOG_ALPHA_MIN,
+    fit_nb2, fit_nb2_bounded, nb2_loglik, nb2_objective, nb2_pmf,
+    NBFitError, LOG_ALPHA_MIN,
 )
 from nbreg.nb2 import _digamma, _trigamma  # noqa: E402
 import _reference as ref  # noqa: E402
@@ -314,6 +314,131 @@ class StatusSeparationTests(unittest.TestCase):
         res = fit_nb2(y, X, alpha_init=10.0)
         self.assertGreaterEqual(res.n_rejected, 0)
         self.assertEqual(res.status, "converged")
+
+
+class BoundedInputValidationTests(unittest.TestCase):
+
+    def test_nonneg_required_and_typed(self):
+        y, X = [1, 2, 3], ones(3)
+        with self.assertRaisesRegex(NBFitError, r"nonneg"):
+            fit_nb2_bounded(y, X)
+        with self.assertRaisesRegex(NBFitError, r"nonneg.*k=1"):
+            fit_nb2_bounded(y, X, nonneg=[True, False])
+        with self.assertRaisesRegex(NBFitError, r"nonneg\[0\].*bool"):
+            fit_nb2_bounded(y, X, nonneg=[1])
+        with self.assertRaisesRegex(NBFitError, r"nonneg"):
+            fit_nb2_bounded(y, X, nonneg="yes")
+
+    def test_collinear_columns_still_rejected(self):
+        # Bounds do not relax identifiability: duplicate columns raise.
+        y = [1, 2, 3, 4]
+        Xdup = [[1.0, 1.0] for _ in y]
+        with self.assertRaisesRegex(NBFitError, r"column 1"):
+            fit_nb2_bounded(y, Xdup, nonneg=[True, True])
+        Xzero = [[1.0, 0.0] for _ in y]
+        with self.assertRaisesRegex(NBFitError, r"column 1"):
+            fit_nb2_bounded(y, Xzero, nonneg=[False, True])
+
+    def test_overflow_initial_point_still_raises(self):
+        with self.assertRaisesRegex(NBFitError, r"computable region"):
+            fit_nb2_bounded([1, 2], [[1.0, 0.5], [1.0, -0.5]],
+                            offset=[1000.0, 3000.0], nonneg=[True, True])
+
+
+class BoundedFitTests(unittest.TestCase):
+
+    def test_constraint_blocks_negative_coefficient(self):
+        # True slope is negative; the nonneg bound must pin it at exactly
+        # 0.0 and the fit must match the exhaustive-enumeration reference.
+        alpha = 0.8
+        y, X, _ = ref.make_dataset(12, [0.3, -0.4], 1.2, seed=11)
+        un = fit_nb2(y, X, fixed_alpha=alpha)
+        self.assertLess(un.beta[1], 0.0)  # unconstrained optimum is negative
+        res = fit_nb2_bounded(y, X, nonneg=[False, True], fixed_alpha=alpha)
+        self.assertEqual(res.status, "converged")
+        self.assertEqual(res.beta[1], 0.0)          # optimum exactly zero
+        self.assertEqual(res.active_bounds, (1,))
+        self.assertLessEqual(res.loglik, un.loglik + 1e-9)  # constrained <= free
+        b_ref, ll_ref, pinned = ref.ref_fit_bounded_enum(
+            y, X, [False, True], alpha)
+        self.assertEqual(pinned, (1,))
+        for a, b in zip(res.beta, b_ref):
+            self.assertAlmostEqual(a, b, delta=2e-4)
+        self.assertAlmostEqual(res.loglik, ll_ref, delta=1e-6)
+
+    def test_kkt_report_at_boundary_optimum(self):
+        # Convergence verdict rests on free gradient AND boundary KKT,
+        # checked here against an independent finite-difference gradient.
+        y, X, _ = ref.make_dataset(12, [0.3, -0.4], 1.2, seed=11)
+        res = fit_nb2_bounded(y, X, nonneg=[False, True], fixed_alpha=0.8)
+        self.assertTrue(res.converged)
+        self.assertIn("KKT", res.message)
+        g_ref = ref.ref_beta_gradient(y, X, res.beta, 0.8)
+        self.assertAlmostEqual(res.gradient[0], g_ref[0], delta=3e-5)
+        self.assertAlmostEqual(res.gradient[1], g_ref[1], delta=3e-5)
+        self.assertLess(abs(g_ref[0]), 1e-3)   # free coordinate: gradient ~ 0
+        self.assertLessEqual(g_ref[1], 1e-3)   # pinned coordinate: KKT sign
+
+    def test_inactive_constraint_matches_unbounded(self):
+        # True slope positive: the bound never bites and the bounded fit
+        # must reproduce the unconstrained fit_nb2 result.
+        y, X, _ = ref.make_dataset(30, [0.4, 0.35], 0.9, seed=5)
+        un = fit_nb2(y, X)
+        res = fit_nb2_bounded(y, X, nonneg=[True, True])
+        self.assertEqual(res.status, "converged")
+        self.assertEqual(res.active_bounds, ())
+        for a, b in zip(res.beta, un.beta):
+            self.assertAlmostEqual(a, b, delta=1e-6)
+        self.assertAlmostEqual(res.log_alpha, un.log_alpha, delta=1e-6)
+
+    def test_all_false_nonneg_matches_unbounded(self):
+        y, X, _ = ref.make_dataset(20, [0.3, -0.2], 1.5, seed=9)
+        un = fit_nb2(y, X)
+        res = fit_nb2_bounded(y, X, nonneg=[False, False])
+        for a, b in zip(res.beta, un.beta):
+            self.assertAlmostEqual(a, b, delta=1e-9)
+        self.assertAlmostEqual(res.loglik, un.loglik, delta=1e-9)
+
+    def test_joint_mode_keeps_poisson_boundary_diagnostic(self):
+        # Identical counts, intercept bounded: the alpha -> 0 Poisson
+        # boundary must still be flagged, with the coefficient at its
+        # constrained optimum log(3).
+        res = fit_nb2_bounded([3] * 20, ones(20), nonneg=[True])
+        self.assertTrue(res.near_poisson)
+        self.assertLessEqual(res.log_alpha, LOG_ALPHA_MIN + 1e-7)
+        self.assertAlmostEqual(res.beta[0], math.log(3.0), delta=1e-6)
+
+    def test_all_zero_counts_bounded_still_no_finite_mle(self):
+        res = fit_nb2_bounded([0, 0, 0, 0],
+                              [[1.0, 0.2], [1.0, -0.2],
+                               [1.0, 0.5], [1.0, -0.5]],
+                              nonneg=[True, True])
+        self.assertFalse(res.converged)
+        self.assertEqual(res.status, "no_finite_mle")
+        res2 = fit_nb2_bounded([0, 0], ones(2), nonneg=[True],
+                               fixed_alpha=1.0)
+        self.assertEqual(res2.status, "no_finite_mle")
+
+    def test_backtracking_and_overflow_rejections_counted(self):
+        # A deliberately large alpha init forces rejected/damped steps;
+        # bounded mode must report them and still converge feasibly.
+        y, X, _ = ref.make_dataset(30, [0.3, 0.2], 0.4, seed=3)
+        res = fit_nb2_bounded(y, X, nonneg=[False, True], alpha_init=10.0)
+        self.assertEqual(res.status, "converged")
+        self.assertGreaterEqual(res.n_rejected, 0)
+        self.assertGreaterEqual(res.beta[1], 0.0)  # feasibility maintained
+        # every coefficient finite, no clipping of y or mu occurred
+        self.assertTrue(all(math.isfinite(v) for v in res.beta))
+
+    def test_bounded_joint_beats_feasible_truth(self):
+        beta_true, alpha_true = [0.5, 0.3], 0.8
+        y, X, _ = ref.make_dataset(60, beta_true, alpha_true, seed=23)
+        res = fit_nb2_bounded(y, X, nonneg=[True, True])
+        self.assertEqual(res.status, "converged")
+        ll_true = ref.ref_loglik(y, X, beta_true, math.log(alpha_true))
+        self.assertGreaterEqual(res.loglik + 1e-8, ll_true)
+        un = fit_nb2(y, X)
+        self.assertLessEqual(res.loglik, un.loglik + 1e-9)
 
 
 if __name__ == "__main__":

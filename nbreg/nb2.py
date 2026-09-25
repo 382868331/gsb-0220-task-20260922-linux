@@ -39,6 +39,7 @@ _ETA_LIMIT = 700.0          # exp(eta) overflows float64 beyond ~709
 _NEAR_POISSON_ALPHA = 1e-6  # fitted alpha below this is flagged near-Poisson
 _SUM_EXACT_MAX_Y = 4096     # exact finite sums for gamma ratios up to this y
 _STEP_CAP = 100.0           # trust-region-style cap on a single Newton step
+_BOUND_TOL = 1e-12          # a bounded beta_j below this counts as at 0
 
 
 class NBFitError(ValueError):
@@ -71,6 +72,9 @@ class NB2Result:
     (d/d beta only when ``fixed_alpha`` mode was used).
     ``n_rejected`` counts backtracking rejections, including
     overflow-rejected steps.
+    ``active_bounds`` lists indices of non-negativity-constrained
+    coefficients sitting at their zero boundary at the returned point
+    (empty for plain :func:`fit_nb2`, which imposes no coefficient bounds).
     """
 
     converged: bool
@@ -87,6 +91,7 @@ class NB2Result:
     fixed_alpha: bool
     n_obs: int
     n_params: int
+    active_bounds: tuple = ()
 
 
 # ---------------------------------------------------------------------------
@@ -466,6 +471,60 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
     non-convergence); raises NBFitError only for invalid input or a
     rank-deficient design.
     """
+    return _fit(y, X, offset=offset, fixed_alpha=fixed_alpha,
+                alpha_init=alpha_init, max_iter=max_iter, gtol=gtol,
+                nonneg=None)
+
+
+def fit_nb2_bounded(y, X, offset=None, nonneg=None, fixed_alpha=None,
+                    alpha_init=None, max_iter=200, gtol=1e-8):
+    """Fit the NB2 regression with non-negativity bounds on some betas.
+
+    Same model, likelihood, offset handling and optimizer as
+    :func:`fit_nb2`; the only difference is that selected coefficients
+    are constrained to be >= 0.  All other betas and log alpha remain
+    free.  The constraint acts on the coefficients only -- y, mu and the
+    data are never clipped or altered.
+
+    Parameters are exactly those of :func:`fit_nb2`, plus:
+
+    nonneg : sequence of k bools (required).  ``nonneg[j] is True``
+        pins beta_j to the half-line [0, inf).  Elements must be real
+        bools; anything else is rejected with a locatable error.
+
+    Method: an active-set / projected Newton iteration.  Coefficients
+    sitting at 0 with a gradient pointing out of the feasible half-line
+    are frozen (KKT); a frozen coefficient is released when its gradient
+    turns positive (the only direction in which the likelihood can
+    improve).  Newton steps are taken in the free subspace; the Armijo
+    backtracking projects trial points back onto the feasible box and
+    measures the sufficient decrease along the *actually taken*
+    displacement, so every accepted step is both feasible and improving.
+    Convergence requires the free-coordinate projected gradient AND the
+    boundary KKT sign conditions to hold within tolerance -- never a
+    mere small parameter change.  The log-alpha box handling, the
+    near-Poisson diagnostic (joint mode) and the fixed-alpha mode are
+    unchanged.
+
+    The returned ``NB2Result.active_bounds`` lists the constrained
+    coefficients that ended up exactly at 0.
+    """
+    if nonneg is None:
+        raise NBFitError(
+            "nonneg must be a sequence of k bools marking the "
+            "coefficients constrained to be >= 0 (got None); use "
+            "fit_nb2 for an unconstrained fit")
+    return _fit(y, X, offset=offset, nonneg=nonneg, fixed_alpha=fixed_alpha,
+                alpha_init=alpha_init, max_iter=max_iter, gtol=gtol)
+
+
+def _fit(y, X, offset, fixed_alpha, alpha_init, max_iter, gtol, nonneg):
+    """Shared Newton engine for fit_nb2 / fit_nb2_bounded.
+
+    ``nonneg`` is None (unconstrained, the original fit_nb2 behaviour)
+    or a sequence of k bools.  The unconstrained path is byte-for-byte
+    the original algorithm.
+    """
     yv, Xv, off = _validate_xy(y, X, offset)
     n = len(yv)
     k = len(Xv[0])
@@ -480,6 +539,24 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
         fixed_alpha = _validate_positive_alpha(fixed_alpha, "fixed_alpha")
     if alpha_init is not None:
         alpha_init = _validate_positive_alpha(alpha_init, "alpha_init")
+    if nonneg is not None:
+        if isinstance(nonneg, (str, bytes)):
+            raise NBFitError(
+                "nonneg must be a sequence of k bools, not a string")
+        try:
+            nonneg = list(nonneg)
+        except TypeError:
+            raise NBFitError(
+                "nonneg must be a sequence of k bools") from None
+        if len(nonneg) != k:
+            raise NBFitError(
+                f"nonneg must have exactly k={k} entries, "
+                f"got {len(nonneg)}")
+        for j, v in enumerate(nonneg):
+            if type(v) is not bool:
+                raise NBFitError(
+                    f"nonneg[{j}] must be a bool, got "
+                    f"{type(v).__name__} {v!r}")
 
     _check_full_rank(Xv, n, k)
     joint = fixed_alpha is None
@@ -495,6 +572,10 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
         if c0 != 0.0 and all(Xv[i][j] == c0 for i in range(n)):
             beta0[j] = (math.log(mean_y + 0.5) - mean_off) / c0
             break
+    if nonneg is not None:  # start feasible: project the initial point
+        for j in range(k):
+            if nonneg[j] and beta0[j] < 0.0:
+                beta0[j] = 0.0
     if joint:
         if alpha_init is not None:
             theta0 = math.log(alpha_init)
@@ -539,8 +620,11 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
     if all_zero:
         # Structural verdict (proved, not a budget outcome): every factor
         # of the likelihood is exp(-r log(1+alpha*mu)) < 1 and tends to 1
-        # only as mu -> 0 (eta -> -inf), so the supremum 0 is not attained
-        # at any finite parameter in either mode.
+        # only as mu -> 0 (eta -> -inf) or as alpha -> inf (r log(1+a*mu)
+        # -> 0), so the supremum 0 is not attained at any finite
+        # parameter.  Coefficient bounds cannot change this: the
+        # alpha -> inf route stays feasible for every finite beta, hence
+        # the verdict holds identically with or without nonneg bounds.
         ll, g, _, _ = ev
         if not joint:
             g = g[:k]
@@ -548,9 +632,10 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
             converged=False,
             status="no_finite_mle",
             message=("all counts are zero: the log-likelihood is < 0 for "
-                     "every finite mu and reaches its supremum 0 only as "
-                     "mu -> 0 (eta -> -inf); no finite MLE exists, in "
-                     "joint or fixed-alpha mode"),
+                     "every finite parameter and reaches its supremum 0 "
+                     "only as mu -> 0 (eta -> -inf) or alpha -> inf; no "
+                     "finite MLE exists, in joint or fixed-alpha mode, "
+                     "with or without coefficient bounds"),
             beta=list(p[:k]),
             log_alpha=(p[k] if joint else theta_fixed),
             alpha=(math.exp(p[k]) if joint else fixed_alpha),
@@ -566,8 +651,16 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
 
     while True:
         ll, g, H, etas = ev
-        # --- convergence: projected gradient (KKT at the alpha bounds) ---
+        # --- convergence: projected gradient (KKT at all bounds) --------
+        # Free coordinates need |g| small; a coefficient frozen at its
+        # zero bound is KKT-satisfied iff its gradient points out of the
+        # feasible half-line (g <= 0 for a maximization with beta >= 0).
+        # Parameter-change size is never used as a convergence signal.
         gp = list(g)
+        if nonneg is not None:
+            for j in range(k):
+                if nonneg[j] and p[j] <= _BOUND_TOL and g[j] <= 0.0:
+                    gp[j] = 0.0
         if joint:
             th = p[k]
             if th <= LOG_ALPHA_MIN + 1e-9 and g[k] < 0.0:
@@ -579,6 +672,9 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
             status = "converged"
             message = ("projected gradient infinity-norm below "
                        "gtol * max(1, |loglik|)")
+            if nonneg is not None:
+                message += ("; boundary KKT signs (g <= 0 at every "
+                            "pinned zero coefficient) verified")
             break
         if it >= max_iter:
             status = "max_iter"
@@ -588,17 +684,25 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
             break
 
         # --- damped Newton direction on the observed Hessian -------------
-        # Active-set handling: if log alpha sits at a box bound with the
-        # gradient pointing outward, freeze that coordinate (KKT) and take
-        # the Newton step in beta only.  Without this the near-singular
-        # Poisson-bound Hessian (H_theta theta -> 0 as alpha -> 0) would
-        # couple tiny theta moves into the beta block and stall.
-        active = -1
+        # Active-set handling: coordinates sitting at a bound with the
+        # gradient pointing outward are frozen (KKT) and the Newton step
+        # is taken in the free subspace only.  This covers the log-alpha
+        # box (without it the near-singular Poisson-bound Hessian,
+        # H_theta theta -> 0 as alpha -> 0, would couple tiny theta moves
+        # into the beta block and stall) and every nonneg coefficient
+        # pinned at 0.  A frozen coefficient is released automatically as
+        # soon as its gradient turns positive, because then it no longer
+        # satisfies the freezing test.
+        active = set()
         if joint:
             if p[k] <= LOG_ALPHA_MIN + 1e-9 and g[k] < 0.0:
-                active = k
+                active.add(k)
             elif p[k] >= LOG_ALPHA_MAX - 1e-9 and g[k] > 0.0:
-                active = k
+                active.add(k)
+        if nonneg is not None:
+            for j in range(k):
+                if nonneg[j] and p[j] <= _BOUND_TOL and g[j] <= 0.0:
+                    active.add(j)
         negH = [[-H[i][j] for j in range(dim)] for i in range(dim)]
         diag = max(1.0, max(negH[i][i] for i in range(dim)))
         lam = 1e-10 * diag
@@ -608,12 +712,12 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
         for _ in range(14):
             M = [[negH[i][j] + (lam if i == j else 0.0)
                   for j in range(dim)] for i in range(dim)]
-            if active >= 0:
+            for a in active:
                 for i in range(dim):
-                    M[i][active] = 0.0
-                    M[active][i] = 0.0
-                M[active][active] = 1.0
-                rhs[active] = 0.0
+                    M[i][a] = 0.0
+                    M[a][i] = 0.0
+                M[a][a] = 1.0
+                rhs[a] = 0.0
             d = _cholesky_solve(M, rhs)
             if d is not None:
                 gtd = sum(g[i] * d[i] for i in range(dim))
@@ -621,10 +725,10 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
                     break
             lam *= 100.0
             d = None
-        if d is None:  # fall back to steepest ascent (active coord zero)
+        if d is None:  # fall back to steepest ascent (active coords zero)
             d = list(g)
-            if active >= 0:
-                d[active] = 0.0
+            for a in active:
+                d[a] = 0.0
             gtd = sum(v * v for v in d)
         dn = max(abs(v) for v in d)
         if dn > _STEP_CAP:
@@ -632,12 +736,26 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
             gtd = sum(g[i] * d[i] for i in range(dim))
 
         # --- Armijo backtracking; overflow/bounds => rejected step -------
+        # Trial points are projected back onto the feasible box (bounded
+        # coefficients clipped at 0 -- a projection of the *coefficients*,
+        # never of y or mu), and the sufficient-decrease test is measured
+        # along the displacement actually taken, so every accepted step is
+        # both feasible and strictly improving.
         s = 1.0
         accepted = None
         for _ in range(60):
             cand = [p[i] + s * d[i] for i in range(dim)]
+            if nonneg is not None:
+                for j in range(k):
+                    if nonneg[j] and cand[j] < 0.0:
+                        cand[j] = 0.0
+            gtu = sum(g[i] * (cand[i] - p[i]) for i in range(dim))
+            if gtu <= 0.0:  # projection destroyed descent: keep halving
+                s *= 0.5
+                n_rejected += 1
+                continue
             evc = evaluate(cand)
-            if evc is not None and evc[0] >= ll + 1e-4 * s * gtd:
+            if evc is not None and evc[0] >= ll + 1e-4 * gtu:
                 accepted = (cand, evc)
                 break
             s *= 0.5
@@ -658,6 +776,11 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
     else:
         log_alpha = theta_fixed
         alpha = fixed_alpha
+    if nonneg is not None:
+        active_bounds = tuple(
+            j for j in range(k) if nonneg[j] and p[j] <= _BOUND_TOL)
+    else:
+        active_bounds = ()
     return NB2Result(
         converged=(status == "converged"),
         status=status,
@@ -673,4 +796,5 @@ def fit_nb2(y, X, offset=None, fixed_alpha=None, alpha_init=None,
         fixed_alpha=not joint,
         n_obs=n,
         n_params=dim,
+        active_bounds=active_bounds,
     )
