@@ -19,8 +19,9 @@ Var(y_i) = mu_i + alpha · mu_i²        (alpha > 0)
 ## 运行命令
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（28 个）
+python -m unittest discover -s tests -v   # 必要测试（51 个，含区间删失新增）
 python demo.py                            # 固定输入演示，实测约 0.05 秒（远低于 8 秒预算）
+python demo_iteration.py                  # 区间删失观测演示（实测约 0.1 秒，远低于 90 秒预算）
 ```
 
 无需网络、账号、密钥、Docker、数据库或任何中间件；不读取任何配置或环境变量。
@@ -146,9 +147,84 @@ python demo.py                            # 固定输入演示，实测约 0.05 
 
 ```
 nbreg/__init__.py     公共接口
-nbreg/nb2.py          核心：特殊函数、似然/梯度/Hessian、牛顿拟合
-tests/test_nb2.py     必要测试
+nbreg/nb2.py          核心：特殊函数、似然/梯度/Hessian、牛顿拟合、区间删失似然
+tests/test_nb2.py     精确计数必要测试（28 个）
+tests/test_censored.py 区间删失观测测试（23 个）
 tests/_reference.py   独立参考（不调用被测核心）
-demo.py               固定输入演示：正常拟合 + 真实触发的异常边界 + 结构边界
+demo.py               精确计数演示：正常拟合 + 真实触发的异常边界 + 结构边界
+demo_iteration.py     区间删失演示：混合观测拟合 + 不可识别 + 尾预算中止
 README.md
 ```
+
+---
+
+# 区间删失观测扩展（本轮新增）
+
+观测不再限于精确计数。新增入口支持三类观测混合拟合，**alpha 固定、只拟合回归系数 beta**：
+
+- 精确计数 `k`：似然用 PMF `P(Y = k)`；
+- 有限整数闭区间 `(lo, hi)`：似然用区间概率 `P(lo <= Y <= hi)`，对区间内的
+  PMF **直接求和**（全对数空间），不做 CDF 差值，**绝不把区间中点当观测值**
+  （有测试保证中点拟合结果与区间似然结果不同）；
+- “至少 L” `(lo, None)`：似然用右尾概率 `P(Y >= lo)`，从 `lo` 向上直接求和。
+
+## 尾部求和的剩余界与预算
+
+右尾（或上界很远的区间）求和在**显式几何剩余界**下提前停止：以
+`rho = w * max(1, (K+1+r)/(K+2))`（`w = alpha*mu/(1+alpha*mu)`，支配所有后续
+PMF 比值）同时界定质量残差 `R0`、一阶导分子残差 `R1`、二阶导分子残差 `R2`
+（用到 `sum rho^j`、`sum j rho^j`、`sum j^2 rho^j` 的闭式），三者均低于
+`tail_tol`（默认 1e-12，相对口径）才停止。项数预算 `tail_budget`
+（默认 200000）耗尽时**中止该次目标求值并说明原因**——拟合器把该候选点
+判为拒绝步（计入 `n_rejected`），初始点耗尽则抛 `NBFitError`；截断尾和
+**永远不会被当作精确似然**返回。
+
+## 新增接口
+
+### `fit_nb2_censored(obs, X, alpha, offset=None, max_iter=200, gtol=1e-8, tail_tol=1e-12, tail_budget=200000) -> NB2Result`
+
+- `obs`：长度 1..100；每项为非负 `int`（精确）、`(lo, hi)` 非负 int 闭区间、
+  或 `(lo, None)` 右尾。拒绝 `bool`/`float`/负值/`hi < lo`，错误带下标。
+- `alpha`：**必填**正有限实数（固定离散参数，只拟合 beta）。
+- 返回 `NB2Result`（`fixed_alpha=True`，`gradient` 长度为 k，仅对 beta）。
+- **全部观测为精确计数时退化到原固定 alpha 路径**（等价于
+  `fit_nb2(..., fixed_alpha=alpha)`，有测试逐位对照）。
+- **全部观测只有下界时不可识别**：每个因子 `P(Y >= L)` 对 mu 严格递增，
+  上确界 0 只在 `mu -> inf` 达到，返回 `status="no_finite_mle"`（结构性判定，
+  与预算耗尽 `max_iter` 严格区分）。
+
+### 纯函数（便于独立核验）
+
+- `nb2_interval_logprob(lo, hi, mu, alpha, tail_tol=..., tail_budget=...)`：
+  单区间/右尾对数概率；预算耗尽抛 `NBFitError`。
+- `nb2_censored_loglik(obs, X, beta, alpha, offset=None, ...)`、
+  `nb2_censored_objective(...)`：删失似然与对 beta 的梯度。
+
+## 误差口径（新增部分，float64）
+
+- 区间/右尾概率与独立参考（PMF 比值递推暴力求和，不 import 被测核心）一致到
+  **1e-10 绝对误差**（小计数范围、含 mu=2 时 `[40, 41]` 这类极窄尾区间）；
+  全支持区间 `(0, None)` 精确短路为 `log P = 0`。
+- 删失似然梯度对独立参考似然的中心有限差分（h=1e-6）一致到 **3e-5**
+  （有限差分自身误差量级）；收敛点梯度无穷范数 < 1e-8·max(1,|ll|)。
+- 求和截断误差由 `tail_tol` 控制并有显式剩余界，不是无界截断。
+
+## 运行命令（更新）
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # 准备 venv（可选，无第三方依赖）
+python -m unittest discover -s tests -v             # 全部测试（51 个：28 旧 + 23 新）
+python demo.py                                      # 原精确计数演示（约 0.05 秒）
+python demo_iteration.py                            # 区间删失演示（实测约 0.1 秒，预算 90 秒）
+```
+
+环境：Linux 原生 Python 3.14.7，仅标准库；核心、测试、演示全部离线，
+不用 Docker、外部服务或真实凭据；数据均为代码内确定性合成，不读取真实调查记录。
+
+## 已知限制（新增）
+
+- 删失路径只支持**固定 alpha**；不联合估计 alpha（本轮限定）。
+- 观测类型仅精确 / 闭区间 / 右尾三类；不支持左截断、开区间或区间权重。
+- 右尾在 `alpha*mu/(1+alpha*mu)` 极接近 1（巨大 mu）时求和变慢，可能触发
+  预算中止——这是按设计中止求值，而不是返回截断近似。
+- 区间概率低于 float 下限（约 1e-324）时该点似然视为 -inf，候选步被拒绝。

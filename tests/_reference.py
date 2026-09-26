@@ -151,3 +151,93 @@ def make_dataset(n, beta_true, alpha_true, offset=None, seed=12345):
         eta = offset[i] + sum(X[i][j] * beta_true[j] for j in range(k))
         y.append(sample_nb(math.exp(eta), alpha_true, next(rng)))
     return y, X, offset
+
+
+# ---------------------------------------------------------------------------
+# Independent references for interval-censored observations.
+# Different numerical route from the core: pmf ratio recurrence summed in
+# linear space with math.fsum, plus a logsumexp done by hand.
+# ---------------------------------------------------------------------------
+
+def ref_interval_prob(lo, hi, mu, alpha, kmax=200000):
+    """P(lo <= Y <= hi) by brute-force recurrence summation.
+
+    hi=None sums the right tail until the terms vanish; kmax is a safety
+    stop for the reference only.
+    """
+    r = 1.0 / alpha
+    ratio = alpha * mu / (1.0 + alpha * mu)
+    pk = (1.0 + alpha * mu) ** (-r)
+    total = 0.0
+    k = 0
+    while True:
+        if k >= lo and (hi is None or k <= hi):
+            total += pk
+        k += 1
+        if hi is None:
+            if k > lo and pk < 1e-20 * max(total, 1e-300):
+                break
+        elif k > hi:
+            break
+        if k > kmax:
+            raise RuntimeError("reference sum did not converge")
+        pk *= (k - 1 + r) / k * ratio
+    return total
+
+
+def ref_interval_logprob(lo, hi, mu, alpha):
+    p = ref_interval_prob(lo, hi, mu, alpha)
+    if p <= 0.0:
+        return -math.inf
+    return math.log(p)
+
+
+def _obs_ref_logprob(ob, mu, alpha):
+    if type(ob) is int:
+        return nb_log_pmf(ob, mu, alpha)
+    lo, hi = ob
+    return ref_interval_logprob(lo, hi, mu, alpha)
+
+
+def ref_censored_loglik(obs, X, beta, alpha, offset=None):
+    n = len(obs)
+    if offset is None:
+        offset = [0.0] * n
+    total = 0.0
+    for i in range(n):
+        eta = offset[i] + sum(X[i][j] * beta[j] for j in range(len(beta)))
+        total += _obs_ref_logprob(obs[i], math.exp(eta), alpha)
+    return total
+
+
+def ref_censored_fd_gradient(obs, X, beta, alpha, offset=None, h=1e-6):
+    """Central finite differences of the reference censored log-likelihood."""
+    b = list(beta)
+    g = []
+    for j in range(len(b)):
+        b[j] += h
+        up = ref_censored_loglik(obs, X, b, alpha, offset)
+        b[j] -= 2 * h
+        dn = ref_censored_loglik(obs, X, b, alpha, offset)
+        b[j] = beta[j]
+        g.append((up - dn) / (2 * h))
+    return g
+
+
+def make_censored_dataset(n, beta_true, alpha_true, seed=99):
+    """Synthetic interval-censored sample: exact counts from CDF inversion,
+    then a deterministic mix of exact / interval / at-least-L observations.
+    """
+    y, X, offset = make_dataset(n, beta_true, alpha_true, seed=seed)
+    obs = []
+    for i, v in enumerate(y):
+        m = i % 3
+        if m == 0:
+            obs.append(v)                       # exact
+        elif m == 1:
+            width = 1 + (i % 3)
+            lo = max(0, v - width)
+            obs.append((lo, v + width))         # closed interval around v
+        else:
+            obs.append((max(0, v - (i % 2)), None))  # at least L
+    return obs, X, offset, y

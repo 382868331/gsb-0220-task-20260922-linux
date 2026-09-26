@@ -39,6 +39,8 @@ _ETA_LIMIT = 700.0          # exp(eta) overflows float64 beyond ~709
 _NEAR_POISSON_ALPHA = 1e-6  # fitted alpha below this is flagged near-Poisson
 _SUM_EXACT_MAX_Y = 4096     # exact finite sums for gamma ratios up to this y
 _STEP_CAP = 100.0           # trust-region-style cap on a single Newton step
+_TAIL_TOL_DEFAULT = 1e-12   # relative residual-mass tolerance for tail sums
+_TAIL_BUDGET_DEFAULT = 200_000  # max terms in one interval/tail summation
 
 
 class NBFitError(ValueError):
@@ -403,6 +405,504 @@ def nb2_pmf(y_count, mu, alpha):
     if log_p < -745.0:
         return 0.0
     return math.exp(log_p)
+
+
+# chunk A: observation parsing + scalar logpmf
+class _TailBudgetError(Exception):
+    """Internal: a tail/interval summation exhausted its term budget.
+
+    Carries a human-readable reason; converted into a rejected objective
+    evaluation inside the fitter (never silently treated as an exact
+    likelihood), or into NBFitError at the public boundary.
+    """
+
+
+def _validate_tail_controls(tail_tol, tail_budget):
+    if not _is_real(tail_tol) or not math.isfinite(tail_tol) \
+            or not 0.0 < tail_tol <= 1.0:
+        raise NBFitError(
+            f"tail_tol must be a finite real in (0, 1], got {tail_tol!r}")
+    if type(tail_budget) is not int or not 1 <= tail_budget <= 100_000_000:
+        raise NBFitError(
+            "tail_budget must be an int in [1, 100000000] (bool rejected), "
+            f"got {tail_budget!r}")
+    return float(tail_tol), tail_budget
+
+
+def _validate_obs(obs):
+    """Parse the observation list into (lo, hi) pairs; hi=None means tail.
+
+    Each observation is either a non-negative int (exact count) or a
+    2-element tuple/list (lo, hi) of non-negative ints with lo <= hi
+    (closed integer interval), or (lo, None) for "at least lo".
+    """
+    if isinstance(obs, (str, bytes)):
+        raise NBFitError("obs must be a sequence of observations, not a string")
+    try:
+        items = list(obs)
+    except TypeError:
+        raise NBFitError("obs must be a sequence of observations") from None
+    if not 1 <= len(items) <= MAX_SAMPLES:
+        raise NBFitError(
+            f"obs must contain 1..{MAX_SAMPLES} observations, got {len(items)}")
+    parsed = []
+    for i, ob in enumerate(items):
+        if type(ob) is int:
+            if ob < 0:
+                raise NBFitError(f"obs[{i}] must be non-negative, got {ob}")
+            parsed.append((ob, ob))
+            continue
+        if isinstance(ob, bool) or not isinstance(ob, (tuple, list)):
+            raise NBFitError(
+                f"obs[{i}] must be an int count or a (lo, hi) pair, got "
+                f"{type(ob).__name__} {ob!r}")
+        if len(ob) != 2:
+            raise NBFitError(
+                f"obs[{i}] must have exactly 2 elements (lo, hi), "
+                f"got {len(ob)}")
+        lo, hi = ob
+        if type(lo) is not int or lo < 0:
+            raise NBFitError(
+                f"obs[{i}][0] (lo) must be a non-negative int (bool "
+                f"rejected), got {lo!r}")
+        if hi is not None:
+            if type(hi) is not int or hi < 0:
+                raise NBFitError(
+                    f"obs[{i}][1] (hi) must be a non-negative int or None "
+                    f"(bool rejected), got {hi!r}")
+            if hi < lo:
+                raise NBFitError(
+                    f"obs[{i}] has hi < lo ({hi} < {lo}); intervals are "
+                    "closed [lo, hi]")
+        parsed.append((lo, hi))
+    return parsed
+
+
+def _log_pmf_scalar(k, eta, theta):
+    """log P(Y=k) at log-mu eta and log-alpha theta (stable, no overflow)."""
+    alpha = math.exp(theta)
+    r = 1.0 / alpha
+    t = theta + eta
+    if t > 35.0:
+        L = t + math.log1p(math.exp(-t))
+    else:
+        L = math.log1p(math.exp(t))
+    if k <= _SUM_EXACT_MAX_Y:
+        lg_ratio = 0.0
+        for m in range(k):
+            lg_ratio += math.log(r + m)
+    else:
+        lg_ratio = math.lgamma(k + r) - math.lgamma(r)
+    return lg_ratio - math.lgamma(k + 1) + k * t - (k + r) * L
+
+
+def _interval_sums(lo, hi, eta, theta, tail_tol, tail_budget):
+    """Sums over P(lo <= Y <= hi) at (eta, theta) = (log mu, log alpha).
+
+    Returns (logP, dlogP/deta, d2logP/deta2).  The probability is a direct
+    sum of pmf terms (never a CDF difference, never a midpoint surrogate).
+    For hi=None (right tail) or hi far out, the sum stops early only when
+    the *explicit* geometric residual bounds R0/R1/R2 (for the mass, the
+    first derivative numerator and the second derivative numerator) are
+    below tail_tol relative to the accumulated sums; the residual bound
+    uses rho = w * max(1, (K+1+r)/(K+2)) with w = alpha*mu/(1+alpha*mu),
+    which dominates every later pmf ratio.  If tail_budget terms do not
+    suffice, _TailBudgetError is raised -- the truncated sum is NOT a
+    valid likelihood and must not be used as one.
+    """
+    if lo == 0 and hi is None:
+        # Whole support: P = 1 exactly, derivatives exactly zero.
+        return 0.0, 0.0, 0.0
+    alpha = math.exp(theta)
+    r = 1.0 / alpha
+    t = theta + eta
+    if t > 35.0:
+        L = t + math.log1p(math.exp(-t))
+    else:
+        L = math.log1p(math.exp(t))
+    w = math.exp(eta - L)          # mu/(1+alpha*mu)
+    q = math.exp(-L)               # 1/(1+alpha*mu)
+    aw = alpha * w                 # alpha*mu/(1+alpha*mu) in (0, 1)
+
+    s0 = 0.0   # sum p_k
+    s1 = 0.0   # sum p_k * g_k,         g_k = d log p_k / d eta
+    s2 = 0.0   # sum p_k * (g_k^2 + h_k), h_k = d2 log p_k / d eta^2
+    terms = 0
+    k = lo
+    pk = 0.0
+    while True:
+        if hi is not None and k > hi:
+            break
+        logp = _log_pmf_scalar(k, eta, theta)
+        pk = math.exp(logp) if logp >= -745.0 else 0.0
+        gb = k - (k + r) * aw
+        hw = (k + r) * aw * q
+        s0 += pk
+        s1 += pk * gb
+        s2 += pk * (gb * gb - hw)
+        terms += 1
+        if terms > tail_budget:
+            raise _TailBudgetError(
+                f"tail summation for P(Y >= {lo}) at mu=exp({eta:.6g}), "
+                f"alpha={alpha:.6g} did not converge within the term "
+                f"budget ({tail_budget} terms); the truncated tail sum "
+                "is not an exact likelihood, so this objective evaluation "
+                "was aborted")
+        # Early stop on an explicit residual bound (tail or far hi).
+        if k >= lo + 2 and (hi is None or k < hi):
+            rho = aw * max(1.0, (k + 1.0 + r) / (k + 2.0))
+            if rho < 1.0:
+                orho = 1.0 - rho
+                m = k + 1.0 + r
+                r0 = pk * rho / orho
+                r1 = 2.0 * pk * (m * rho / orho
+                                 + rho * rho / (orho * orho))
+                r2 = 5.0 * pk * (m * m * rho / orho
+                                 + 2.0 * m * rho * rho / (orho * orho)
+                                 + 2.0 * rho ** 3 / (orho ** 3))
+                if (r0 <= tail_tol * max(s0, 1e-300)
+                        and r1 <= tail_tol * (abs(s1) + m * s0 + 1e-300)
+                        and r2 <= tail_tol * (abs(s2) + m * m * s0 + 1e-300)):
+                    break
+        k += 1
+    if s0 <= 0.0:
+        # Every pmf term underflowed the float floor: the interval
+        # probability is below ~1e-324, so the log-likelihood is
+        # effectively -inf at this point.  Treated as an invalid
+        # evaluation (rejected step), never as a finite number.
+        raise _TailBudgetError(
+            f"interval [{lo}, {hi if hi is not None else 'inf'}] has "
+            f"probability below the float floor at mu=exp({eta:.6g}), "
+            f"alpha={alpha:.6g}; log-likelihood is -inf here")
+    d1 = s1 / s0
+    d2 = s2 / s0 - d1 * d1
+    return math.log(s0), d1, d2
+
+
+def nb2_interval_logprob(lo, hi, mu, alpha,
+                         tail_tol=_TAIL_TOL_DEFAULT,
+                         tail_budget=_TAIL_BUDGET_DEFAULT):
+    """log P(lo <= Y <= hi) for NB2(mu, alpha); hi=None means P(Y >= lo).
+
+    Direct log-space pmf summation with an explicit residual-mass bound;
+    raises NBFitError if the term budget is exhausted (the truncated sum
+    is never returned as if it were exact).
+    """
+    if type(lo) is not int or lo < 0:
+        raise NBFitError(
+            f"lo must be a non-negative int (bool rejected), got {lo!r}")
+    if hi is not None:
+        if type(hi) is not int or hi < 0:
+            raise NBFitError(
+                f"hi must be a non-negative int or None (bool rejected), "
+                f"got {hi!r}")
+        if hi < lo:
+            raise NBFitError(f"hi={hi} < lo={lo}; intervals are [lo, hi]")
+    if not _is_real(mu) or not math.isfinite(mu) or mu <= 0.0:
+        raise NBFitError(f"mu must be a positive finite number, got {mu!r}")
+    if not _is_real(alpha) or not math.isfinite(alpha) or alpha <= 0.0:
+        raise NBFitError(
+            f"alpha must be a positive finite number, got {alpha!r}")
+    tail_tol, tail_budget = _validate_tail_controls(tail_tol, tail_budget)
+    try:
+        logp, _, _ = _interval_sums(lo, hi, math.log(mu), math.log(alpha),
+                                    tail_tol, tail_budget)
+    except _TailBudgetError as exc:
+        raise NBFitError(str(exc)) from None
+    return logp
+
+
+def _validate_beta(bv, k):
+    if isinstance(bv, (str, bytes)):
+        raise NBFitError("beta must be a sequence of k real numbers")
+    try:
+        bv = list(bv)
+    except TypeError:
+        raise NBFitError("beta must be a sequence of k real numbers") from None
+    if len(bv) != k:
+        raise NBFitError(f"beta must have length k={k}, got {len(bv)}")
+    for j, v in enumerate(bv):
+        if not _is_real(v) or not math.isfinite(v):
+            raise NBFitError(f"beta[{j}] must be a finite real number, got {v!r}")
+    return [float(v) for v in bv]
+
+
+def _censored_loglik_grad_hess(parsed, Xv, off, beta, theta,
+                               tail_tol, tail_budget):
+    """(loglik, grad[k], Hessian[k][k]) for interval-censored observations.
+
+    For observation i with eta_i = x_i.beta + offset_i the per-observation
+    scalar derivatives d1 = d logP/d eta and d2 = d2 logP/d eta2 from
+    _interval_sums give grad += d1 * x_i and H += d2 * x_i x_i^T.
+    """
+    n = len(parsed)
+    k = len(beta)
+    ll = 0.0
+    g = [0.0] * k
+    H = [[0.0] * k for _ in range(k)]
+    etas = [0.0] * n
+    for i in range(n):
+        xi = Xv[i]
+        eta = off[i]
+        for j in range(k):
+            eta += xi[j] * beta[j]
+        etas[i] = eta
+        lo, hi = parsed[i]
+        logp, d1, d2 = _interval_sums(lo, hi, eta, theta,
+                                      tail_tol, tail_budget)
+        ll += logp
+        for j in range(k):
+            g[j] += d1 * xi[j]
+            xj = xi[j]
+            for jj in range(j + 1):
+                H[j][jj] += d2 * xj * xi[jj]
+    for j in range(k):
+        for jj in range(j):
+            H[jj][j] = H[j][jj]
+    return ll, g, H, etas
+
+
+def _validate_censored_inputs(obs, X, offset, alpha, tail_tol, tail_budget):
+    parsed = _validate_obs(obs)
+    n = len(parsed)
+    # Reuse the X/offset validation by passing a dummy exact-count vector.
+    _, Xv, off = _validate_xy([0] * n, X, offset)
+    alpha = _validate_positive_alpha(alpha, "alpha")
+    tail_tol, tail_budget = _validate_tail_controls(tail_tol, tail_budget)
+    return parsed, Xv, off, alpha, tail_tol, tail_budget
+
+
+def nb2_censored_loglik(obs, X, beta, alpha, offset=None,
+                        tail_tol=_TAIL_TOL_DEFAULT,
+                        tail_budget=_TAIL_BUDGET_DEFAULT):
+    """Log-likelihood of interval-censored observations at (beta, alpha).
+
+    obs entries: int k (exact), (lo, hi) closed integer interval, or
+    (lo, None) for "at least lo".  alpha is fixed (positive finite).
+    Pure function for independent verification.  Raises NBFitError on
+    invalid input or tail-budget exhaustion.
+    """
+    parsed, Xv, off, alpha, tail_tol, tail_budget = \
+        _validate_censored_inputs(obs, X, offset, alpha, tail_tol, tail_budget)
+    bv = _validate_beta(beta, len(Xv[0]))
+    try:
+        ll, _, _, _ = _censored_loglik_grad_hess(
+            parsed, Xv, off, bv, math.log(alpha), tail_tol, tail_budget)
+    except _TailBudgetError as exc:
+        raise NBFitError(str(exc)) from None
+    return ll
+
+
+def nb2_censored_objective(obs, X, beta, alpha, offset=None,
+                           tail_tol=_TAIL_TOL_DEFAULT,
+                           tail_budget=_TAIL_BUDGET_DEFAULT):
+    """Return (loglik, gradient); gradient is w.r.t. beta only."""
+    parsed, Xv, off, alpha, tail_tol, tail_budget = \
+        _validate_censored_inputs(obs, X, offset, alpha, tail_tol, tail_budget)
+    bv = _validate_beta(beta, len(Xv[0]))
+    try:
+        ll, g, _, _ = _censored_loglik_grad_hess(
+            parsed, Xv, off, bv, math.log(alpha), tail_tol, tail_budget)
+    except _TailBudgetError as exc:
+        raise NBFitError(str(exc)) from None
+    return ll, g
+
+
+def fit_nb2_censored(obs, X, alpha, offset=None, max_iter=200, gtol=1e-8,
+                     tail_tol=_TAIL_TOL_DEFAULT,
+                     tail_budget=_TAIL_BUDGET_DEFAULT):
+    """Fit NB2 regression coefficients to interval-censored observations.
+
+    alpha is FIXED (positive finite); only beta is optimized.  Each
+    observation contributes its exact likelihood:
+
+    * int k        -> P(Y = k)                (pmf)
+    * (lo, hi)     -> P(lo <= Y <= hi)        (direct pmf sum, log space)
+    * (lo, None)   -> P(Y >= lo)              (right-tail pmf sum with an
+                                               explicit residual-mass bound
+                                               and a term budget)
+
+    Interval midpoints are never used as observations.  When every
+    observation is an exact count the call degenerates to the original
+    fixed-alpha path (fit_nb2 with fixed_alpha=alpha).
+
+    Returns an NB2Result (fixed_alpha=True, gradient w.r.t. beta only).
+    Statuses mirror fit_nb2; additionally, if every observation is a
+    right tail ("at least lo"), the likelihood is strictly increasing in
+    every mu_i and no finite MLE exists -> status "no_finite_mle".
+    A tail summation that exhausts tail_budget aborts that objective
+    evaluation (rejected step, counted in n_rejected); if it happens at
+    the initial point an NBFitError is raised with the reason.
+    """
+    parsed, Xv, off, alpha, tail_tol, tail_budget = \
+        _validate_censored_inputs(obs, X, offset, alpha, tail_tol, tail_budget)
+    n = len(parsed)
+    k = len(Xv[0])
+    if type(max_iter) is not int or not 1 <= max_iter <= 1_000_000:
+        raise NBFitError(
+            f"max_iter must be an int in [1, 1000000] (bool rejected), "
+            f"got {max_iter!r}")
+    if not _is_real(gtol) or not math.isfinite(gtol) or not 0.0 < gtol <= 1.0:
+        raise NBFitError(f"gtol must be a finite real in (0, 1], got {gtol!r}")
+    _check_full_rank(Xv, n, k)
+    theta = math.log(alpha)
+
+    # Degenerate case: all observations exact -> original fixed-alpha path.
+    if all(lo == hi for lo, hi in parsed):
+        return fit_nb2([lo for lo, _ in parsed], X, offset=off,
+                       fixed_alpha=alpha, max_iter=max_iter, gtol=gtol)
+
+    # Structural non-identifiability: only lower bounds.  Every factor
+    # P(Y >= lo_i) is strictly increasing in mu_i and tends to 1 as
+    # mu_i -> inf, so the supremum 0 of the log-likelihood is not attained
+    # at any finite beta.
+    if all(hi is None for _, hi in parsed):
+        ll0, g0, _, _ = _censored_loglik_grad_hess(
+            parsed, Xv, off, [0.0] * k, theta, tail_tol, tail_budget)
+        return NB2Result(
+            converged=False,
+            status="no_finite_mle",
+            message=("every observation is a lower bound (at-least-L): "
+                     "each factor P(Y >= L) is strictly increasing in mu "
+                     "and the supremum 0 of the log-likelihood is reached "
+                     "only as mu -> inf (eta -> +inf); beta is not "
+                     "identifiable, no finite MLE exists"),
+            beta=[0.0] * k,
+            log_alpha=theta,
+            alpha=alpha,
+            loglik=ll0,
+            gradient=list(g0),
+            n_iter=0,
+            n_rejected=0,
+            near_poisson=(alpha < _NEAR_POISSON_ALPHA),
+            fixed_alpha=True,
+            n_obs=n,
+            n_params=k,
+        )
+
+    # Starting values: a constant column absorbs a proxy mean level.  The
+    # proxy (midpoint/lower bound) is used ONLY for this initial guess,
+    # never in the likelihood.
+    proxy = []
+    for lo, hi in parsed:
+        if hi is None:
+            proxy.append(float(lo))
+        else:
+            proxy.append(0.5 * (lo + hi))
+    mean_p = sum(proxy) / n + 0.5
+    mean_off = sum(off) / n
+    p = [0.0] * k
+    for j in range(k):
+        c0 = Xv[0][j]
+        if c0 != 0.0 and all(Xv[i][j] == c0 for i in range(n)):
+            p[j] = (math.log(mean_p) - mean_off) / c0
+            break
+
+    abort_reason = [None]
+
+    def evaluate(pv):
+        abort_reason[0] = None
+        try:
+            ll, g, H, etas = _censored_loglik_grad_hess(
+                parsed, Xv, off, pv, theta, tail_tol, tail_budget)
+        except _TailBudgetError as exc:
+            abort_reason[0] = str(exc)
+            return None
+        if not math.isfinite(ll):
+            return None
+        for e in etas:
+            if e > _ETA_LIMIT or e < -_ETA_LIMIT:
+                return None
+        return ll, g, H, etas
+
+    ev = evaluate(p)
+    if ev is None:
+        reason = abort_reason[0] or (
+            f"initial |x_i.beta + offset_i| exceeds {_ETA_LIMIT:.0f}")
+        raise NBFitError(
+            "initial point is outside the computable region for the "
+            f"censored likelihood: {reason}")
+
+    n_rejected = 0
+    it = 0
+    status = None
+    message = ""
+    while True:
+        ll, g, H, etas = ev
+        gnorm = max(abs(v) for v in g)
+        if gnorm <= gtol * max(1.0, abs(ll)):
+            status = "converged"
+            message = ("gradient infinity-norm below "
+                       "gtol * max(1, |loglik|)")
+            break
+        if it >= max_iter:
+            status = "max_iter"
+            message = (f"iteration budget exhausted (max_iter={max_iter}); "
+                       "returned point is the best found, not a certified "
+                       "optimum")
+            break
+
+        negH = [[-H[i][j] for j in range(k)] for i in range(k)]
+        diag = max(1.0, max(negH[i][i] for i in range(k)))
+        lam = 1e-10 * diag
+        d = None
+        gtd = 0.0
+        for _ in range(14):
+            M = [[negH[i][j] + (lam if i == j else 0.0)
+                  for j in range(k)] for i in range(k)]
+            d = _cholesky_solve(M, g)
+            if d is not None:
+                gtd = sum(g[i] * d[i] for i in range(k))
+                if gtd > 0.0:
+                    break
+            lam *= 100.0
+            d = None
+        if d is None:
+            d = list(g)
+            gtd = sum(v * v for v in d)
+        dn = max(abs(v) for v in d)
+        if dn > _STEP_CAP:
+            d = [v * (_STEP_CAP / dn) for v in d]
+            gtd = sum(g[i] * d[i] for i in range(k))
+
+        s = 1.0
+        accepted = None
+        for _ in range(60):
+            cand = [p[i] + s * d[i] for i in range(k)]
+            evc = evaluate(cand)
+            if evc is not None and evc[0] >= ll + 1e-4 * s * gtd:
+                accepted = (cand, evc)
+                break
+            s *= 0.5
+            n_rejected += 1
+        if accepted is None:
+            status = "line_search_failed"
+            message = ("backtracking line search found no improving step "
+                       "in 60 halvings; returned point is not a certified "
+                       "optimum")
+            if abort_reason[0] is not None:
+                message += "; last aborted evaluation: " + abort_reason[0]
+            break
+        p, ev = accepted
+        it += 1
+
+    ll, g, _, _ = ev
+    return NB2Result(
+        converged=(status == "converged"),
+        status=status,
+        message=message,
+        beta=list(p),
+        log_alpha=theta,
+        alpha=alpha,
+        loglik=ll,
+        gradient=list(g),
+        n_iter=it,
+        n_rejected=n_rejected,
+        near_poisson=(alpha < _NEAR_POISSON_ALPHA),
+        fixed_alpha=True,
+        n_obs=n,
+        n_params=k,
+    )
 
 
 # ---------------------------------------------------------------------------
